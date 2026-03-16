@@ -76,7 +76,117 @@ function findTargetId($, term, idInjections) {
 }
 
 function processHtmlContent(htmlString, addLog) {
-  const regexHtml = /(<i[^>]*>\s*)?([Ss]ee(?:\s+also)?)(?!\s*also)(\s*<\/i>)?(\s+)((?:[^<>\-;,&]|&(?:[a-zA-Z0-9]+|#[0-9]+|#x[a-fA-F0-9]+);)+)/g;
+  // 1. Process <li> elements
+  let resultHtml = "";
+  let lastIndex = 0;
+  const liOpenRegex = /<li((?:\s[^>]*?)?)>/gi;
+  let liMatch;
+  let liCounter = 1;
+
+  while ((liMatch = liOpenRegex.exec(htmlString)) !== null) {
+    resultHtml += htmlString.substring(lastIndex, liMatch.index);
+
+    let attrs = liMatch[1] || "";
+
+    if (!/epub:type=/i.test(attrs)) {
+      attrs += ` epub:type="index-entry"`;
+    }
+
+    if (!/id=['"]([^'"]+)['"]/.test(attrs)) {
+      let newId = `idx${liCounter}`;
+      while (htmlString.includes(`id="${newId}"`) || htmlString.includes(`id='${newId}'`)) {
+        liCounter++;
+        newId = `idx${liCounter}`;
+      }
+      attrs += ` id="${newId}"`;
+      liCounter++;
+    }
+
+    resultHtml += `<li${attrs}>`;
+
+    let currentIndex = liOpenRegex.lastIndex;
+    let inTag = false;
+    let splitAt = -1;
+    let limit = Math.min(currentIndex + 1500, htmlString.length);
+
+    let initialStr = htmlString.substring(currentIndex, currentIndex + 50);
+    if (initialStr.match(/^\s*(?:<[^>]+>\s*)*[Ss]ee\b(?:\s+also|\s+under)?/i)) {
+      splitAt = currentIndex;
+    } else {
+      for (let i = currentIndex; i < limit; i++) {
+        let c = htmlString[i];
+
+        if (!inTag && c === '<') {
+          let upcoming = htmlString.substring(i, i + 10).toLowerCase();
+          if (upcoming.startsWith('</li') || upcoming.startsWith('<ol') ||
+            upcoming.startsWith('<ul') || upcoming.startsWith('<dl') ||
+            upcoming.startsWith('<div') || upcoming.startsWith('<p') ||
+            upcoming.startsWith('<br')) {
+            splitAt = i;
+            break;
+          }
+          inTag = true;
+        } else if (inTag && c === '>') {
+          inTag = false;
+          continue;
+        }
+
+        if (!inTag && c !== '>') {
+          if (c === ',' || c === '\n' || c === '\r') {
+            splitAt = i;
+            break;
+          }
+
+          let rem = htmlString.substring(i, i + 30);
+          if (rem.match(/^\s+(?:<[^>]+>\s*)*[Ss]ee\b(?:\s+also|\s+under)?/i)) {
+            splitAt = i;
+            break;
+          }
+        }
+      }
+    }
+
+    let advanceToIndex = -1;
+
+    if (splitAt !== -1 && splitAt > currentIndex) {
+      let termRaw = htmlString.substring(currentIndex, splitAt);
+      let leadSpaceMatch = termRaw.match(/^\s*/);
+      let trailSpaceMatch = termRaw.match(/\s*$/);
+      let leadSpace = leadSpaceMatch ? leadSpaceMatch[0] : "";
+      let trailSpace = trailSpaceMatch ? trailSpaceMatch[0] : "";
+      let termTrim = termRaw.trim();
+
+      if (termTrim) {
+        resultHtml += `${leadSpace}<span epub:type="index-term">${termTrim}</span>${trailSpace}`;
+      } else {
+        resultHtml += termRaw;
+      }
+      advanceToIndex = splitAt;
+    } else if (splitAt === currentIndex) {
+      advanceToIndex = currentIndex;
+    } else if (splitAt === -1) {
+      let termRaw = htmlString.substring(currentIndex, limit);
+      let leadSpaceMatch = termRaw.match(/^\s*/);
+      let trailSpaceMatch = termRaw.match(/\s*$/);
+      let leadSpace = leadSpaceMatch ? leadSpaceMatch[0] : "";
+      let trailSpace = trailSpaceMatch ? trailSpaceMatch[0] : "";
+      let termTrim = termRaw.trim();
+
+      if (termTrim) {
+        resultHtml += `${leadSpace}<span epub:type="index-term">${termTrim}</span>${trailSpace}`;
+      } else {
+        resultHtml += termRaw;
+      }
+      advanceToIndex = limit;
+    }
+
+    lastIndex = advanceToIndex;
+    liOpenRegex.lastIndex = advanceToIndex;
+  }
+  resultHtml += htmlString.substring(lastIndex);
+  htmlString = resultHtml;
+
+  const regexHtml = /(<i[^>]*>\s*)?([Ss]ee(?:\s+also|\s+under)?)(?!\s*also)(\s*<\/i>)?(\s+)((?:[^<>\-;,&]|&(?:[a-zA-Z0-9]+|#[0-9]+|#x[a-fA-F0-9]+);)+)/g;
 
   const termsToLink = new Set();
   let m;
@@ -85,7 +195,7 @@ function processHtmlContent(htmlString, addLog) {
   while ((m = regexHtml.exec(htmlString)) !== null) {
     let termUntrimmed = m[5];
     let term = termUntrimmed.trimEnd();
-    if (term.toLowerCase() !== "see" && term.toLowerCase() !== "see also") {
+    if (term.toLowerCase() !== "see" && term.toLowerCase() !== "see also" && term.toLowerCase() !== "see under") {
       termsToLink.add(term);
     }
   }
@@ -146,6 +256,10 @@ function App() {
   const [status, setStatus] = useState('idle'); // idle, processing, success, error
   const [errorMsg, setErrorMsg] = useState('');
   const [logs, setLogs] = useState([]);
+  const [zipInstance, setZipInstance] = useState(null);
+  const [availableFiles, setAvailableFiles] = useState([]);
+  const [showFileSelector, setShowFileSelector] = useState(false);
+  const [currentFileObj, setCurrentFileObj] = useState(null);
   const fileInputRef = useRef(null);
 
   const addLog = (msg) => setLogs(prev => [...prev, msg]);
@@ -174,34 +288,36 @@ function App() {
 
         let indexEntryObj = null;
         let indexFileName = '';
+        const possibleFiles = [];
 
         // Find index file
         for (const [filename, fileObj] of Object.entries(contents.files)) {
           if (!fileObj.dir) {
             const nameLower = filename.toLowerCase();
+            if (nameLower.endsWith('.xhtml') || nameLower.endsWith('.html')) {
+              possibleFiles.push(filename);
+            }
             if (nameLower.endsWith('index.xhtml') || nameLower.endsWith('index.html') || /index_split_.*\.xhtml$/.test(nameLower)) {
-              indexEntryObj = fileObj;
-              indexFileName = filename;
-              break;
+              if (!indexEntryObj) {
+                indexEntryObj = fileObj;
+                indexFileName = filename;
+              }
             }
           }
         }
 
         if (!indexEntryObj) {
-          throw new Error('Index file (e.g. index.xhtml) could not be found inside the EPUB.');
+          addLog('Index file not found automatically. Please select from the list.');
+          setZipInstance(zip);
+          setCurrentFileObj(file);
+          setAvailableFiles(possibleFiles);
+          setShowFileSelector(true);
+          setStatus('idle');
+          return;
         }
 
-        addLog(`Found index file: ${indexFileName}`);
-        const htmlContent = await indexEntryObj.async('string');
-        const updatedHtml = processHtmlContent(htmlContent, addLog);
+        await continueProcessingZip(zip, file, indexFileName);
 
-        addLog('Repackaging EPUB...');
-        zip.file(indexFileName, updatedHtml);
-
-        const blob = await zip.generateAsync({ type: 'blob' });
-        saveAs(blob, `Linked_${file.name}`);
-        addLog('Download ready!');
-        setStatus('success');
 
       } else if (ext === 'xhtml' || ext === 'html') {
         addLog(`Loading file: ${file.name}`);
@@ -210,11 +326,34 @@ function App() {
 
         const blob = new Blob([updatedHtml], { type: 'application/xhtml+xml' });
         saveAs(blob, `Linked_${file.name}`);
-        addLog('Download ready!');
+        addLog('Download readyyyyyy!');
         setStatus('success');
       } else {
         throw new Error('Unsupported format. Please upload an .epub or .xhtml file.');
       }
+    } catch (err) {
+      console.error(err);
+      setErrorMsg(err.message);
+      setStatus('error');
+    }
+  };
+
+  const continueProcessingZip = async (zip, originalFile, indexFileName) => {
+    try {
+      setStatus('processing');
+      setShowFileSelector(false);
+      addLog(`Selected index file: ${indexFileName}`);
+      const indexEntryObj = zip.file(indexFileName);
+      const htmlContent = await indexEntryObj.async('string');
+      const updatedHtml = processHtmlContent(htmlContent, addLog);
+
+      addLog('Repackaging EPUB...');
+      zip.file(indexFileName, updatedHtml);
+
+      const blob = await zip.generateAsync({ type: 'blob' });
+      saveAs(blob, `Linked_${originalFile.name}`);
+      addLog('Download ready!');
+      setStatus('success');
     } catch (err) {
       console.error(err);
       setErrorMsg(err.message);
@@ -240,7 +379,7 @@ function App() {
   return (
     <div className="app-container">
       <div className="header">
-        <h1>IndexLinker</h1>
+        <h1>IndexLinker (v1.0.12)</h1>
         <p>Intelligently hyper-link your EPUB index references.</p>
       </div>
 
@@ -264,6 +403,30 @@ function App() {
         <button className="btn-primary" onClick={() => fileInputRef.current.click()}>
           Browse Files
         </button>
+
+        {showFileSelector && (
+          <div className="status-section" style={{ marginTop: '20px', padding: '15px' }}>
+            <div style={{ marginBottom: '10px', color: '#fff' }}>Select Index File:</div>
+            <select
+              id="indexFileSelect"
+              style={{ width: '100%', padding: '8px', marginBottom: '15px', borderRadius: '4px', border: '1px solid #4B5563', background: '#374151', color: '#fff' }}
+            >
+              {availableFiles.map(f => (
+                <option key={f} value={f}>{f}</option>
+              ))}
+            </select>
+            <button
+              className="btn-primary"
+              style={{ width: '100%' }}
+              onClick={() => {
+                const sel = document.getElementById('indexFileSelect').value;
+                continueProcessingZip(zipInstance, currentFileObj, sel);
+              }}
+            >
+              Process Selected
+            </button>
+          </div>
+        )}
 
         {status !== 'idle' && (
           <div className="status-section">

@@ -1,132 +1,255 @@
-import * as cheerio from 'cheerio';
+console.log("Script started...");
+import * as cheerio from "cheerio";
 
-function escapeRegex(string) {
-    return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+/* -------------------------
+   Normalize index terms
+-------------------------- */
+
+function normalizeTerm(term) {
+
+    return term
+        .toLowerCase()
+        .replace(/\(.*/, "")
+        .replace(/[–—]/g, "-")
+        .replace(/-/g, " ")
+        .replace(/[^\w\s]/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
 }
 
-function findTargetId($, term) {
+/* -------------------------
+   Extract term nodes safely
+-------------------------- */
 
-    const termLower = term.toLowerCase().trim();
-    if (!termLower) return null;
+function extractTermParts($li) {
 
-    const blockTags = ['p', 'div', 'li', 'td', 'dt', 'dd'];
-    const elements = $(blockTags.join(',')).toArray();
+    const children = $li.contents().toArray();
 
-    for (const el of elements) {
+    const termNodes = [];
+    const restNodes = [];
 
-        let text = "";
+    let separatorFound = false;
 
-        $(el).contents().each(function () {
-            if (this.type === 'text') text += this.data;
-            else if (this.type === 'tag') text += $(this).text();
-        });
+    children.forEach(node => {
 
-        text = text.trim();
-        const textLower = text.toLowerCase();
+        if (separatorFound) {
+            restNodes.push(node);
+            return;
+        }
 
-        if (textLower.startsWith(termLower)) {
+        if (node.type === "text") {
 
-            const regexEnd = new RegExp("^" + escapeRegex(termLower) + "(?![a-z0-9])", "i");
+            const text = node.data;
 
-            if (regexEnd.test(text)) {
+            const match = text.match(/([,:;(])/);
 
-                const existingId =
-                    $(el).attr('id') ||
-                    $(el).find('[id]').first().attr('id') ||
-                    $(el).find('[name]').first().attr('name');
+            if (match) {
 
-                if (existingId) {
-                    return existingId;
+                const idx = text.indexOf(match[1]);
+
+                const termText = text.slice(0, idx);
+                const restText = text.slice(idx);
+
+                if (termText.trim()) {
+                    termNodes.push({ type: "text", data: termText });
                 }
+
+                restNodes.push({ type: "text", data: restText });
+
+                separatorFound = true;
+
+            } else {
+
+                termNodes.push(node);
+
             }
-        }
-    }
 
-    return null;
-}
-
-function processHtmlContent(htmlString) {
-    const regexHtml = /(<i[^>]*>\s*)?([Ss]ee(?:\s+also)?)(\s*<\/i>)?(\s+)((?:[^<>\-;,&]|&(?:[a-zA-Z0-9]+|#[0-9]+|#x[a-fA-F0-9]+);)+)/g;
-
-    const termsToLink = new Set();
-    let m;
-    while ((m = regexHtml.exec(htmlString)) !== null) {
-        let termUntrimmed = m[5];
-        let term = termUntrimmed.trimEnd();
-        if (term.toLowerCase() !== "see" && term.toLowerCase() !== "see also") {
-            termsToLink.add(term);
-        }
-    }
-
-    const $ = cheerio.load(htmlString, { withStartIndices: true, xmlMode: true, decodeEntities: true });
-
-    const idInjections = [];
-    const termToId = {};
-    for (const term of termsToLink) {
-        const id = findTargetId($, term, idInjections, () => { });
-        if (id) {
-            termToId[term] = id;
-        }
-    }
-
-    let modifiedHtml = htmlString;
-    idInjections.sort((a, b) => b.startIndex - a.startIndex);
-
-    for (const inj of idInjections) {
-        if (inj.startIndex == null) continue;
-
-        const prefix = modifiedHtml.substring(0, inj.startIndex);
-        const remaining = modifiedHtml.substring(inj.startIndex);
-
-        const tagMatch = remaining.match(/^<([a-zA-Z0-9\-:]+)([^>]*)>/);
-
-if (tagMatch) {
-
-    const fullTag = tagMatch[0];
-
-    // Check if id already exists
-    if (/id\s*=/.test(fullTag)) {
-        continue;
-    }
-
-    const insertPos = tagMatch[1].length + 1;
-
-    modifiedHtml =
-        prefix +
-        remaining.substring(0, insertPos) +
-        ` id="${inj.id}"` +
-        remaining.substring(insertPos);
-}
-    }
-
-    modifiedHtml = modifiedHtml.replace(regexHtml, (match, iTagStart, seeText, iTagEnd, spaces, termUntrimmed) => {
-        let term = termUntrimmed.trimEnd();
-        let trailingSpace = termUntrimmed.substring(term.length);
-
-        let id = termToId[term];
-        if (id) {
-            return `${iTagStart || ''}${seeText}${iTagEnd || ''}${spaces}<a href="#${id}">${term}</a>${trailingSpace}`;
         } else {
-            return match;
+
+            termNodes.push(node);
+
         }
+
     });
 
-    return modifiedHtml;
+    return { termNodes, restNodes };
 }
+
+/* -------------------------
+   Convert <li> → index entry
+-------------------------- */
+
+function convertIndexEntries($) {
+
+    let counter = 1;
+
+    $("li").each(function () {
+
+        const $li = $(this);
+
+        if ($li.attr("epub:type") === "index-entry") return;
+
+        const text = $li.text().trim().toLowerCase();
+
+        if (
+            text.startsWith("see ") ||
+            text.startsWith("see also") ||
+            text.startsWith("see under")
+        ) return;
+
+        if (!$li.attr("id")) {
+
+            $li.attr("id", "idx" + counter);
+            counter++;
+
+        }
+
+        $li.attr("epub:type", "index-entry");
+
+        const { termNodes, restNodes } = extractTermParts($li);
+
+        if (!termNodes.length) return;
+
+        const span = $('<span epub:type="index-term"></span>');
+
+        termNodes.forEach(node => span.append(node));
+
+        $li.empty();
+
+        $li.append(span);
+
+        restNodes.forEach(node => $li.append(node));
+
+    });
+
+}
+
+/* -------------------------
+   Build term → id map
+-------------------------- */
+
+function buildIndexMap($) {
+
+    const map = {};
+
+    $('[epub\\:type="index-entry"]').each(function () {
+
+        const $li = $(this);
+
+        const term = $li
+            .find('[epub\\:type="index-term"]')
+            .text()
+            .trim();
+
+        const id = $li.attr("id");
+
+        if (!term || !id) return;
+
+        const normalized = normalizeTerm(term);
+
+        map[normalized] = id;
+
+    });
+
+    return map;
+}
+
+/* -------------------------
+   Link cross references
+-------------------------- */
+
+function linkCrossReferences($, termMap) {
+
+    $("li").each(function () {
+
+        const $li = $(this);
+
+        const html = $li.html();
+
+        if (!html) return;
+
+        const regex =
+            /(<i[^>]*>\s*)(See(?:\s+also|\s+under)?)(\s*<\/i>)(\s+)([^<]+)/i;
+
+        const match = html.match(regex);
+
+        if (!match) return;
+
+        let phrase = match[5].trim();
+
+        /* remove trailing sub phrases */
+        const mainTerm = phrase
+            .replace(/\(.*/, "")
+            .replace(/,.*/, "")
+            .trim();
+
+        const normalized = normalizeTerm(mainTerm);
+
+        const id = termMap[normalized];
+
+        if (!id) return;
+
+        const link = `<a href="#${id}">${mainTerm}</a>`;
+
+        const rest = phrase.substring(mainTerm.length);
+
+        const newHtml =
+            `${match[1]}${match[2]}${match[3]} ${link}${rest}`;
+
+        $li.html(html.replace(regex, newHtml));
+
+    });
+
+}
+
+/* -------------------------
+   Main processing
+-------------------------- */
+
+function processHtmlContent(htmlString) {
+
+    const $ = cheerio.load(htmlString, {
+        xmlMode: true,
+        decodeEntities: true
+    });
+
+    /* Step 1 */
+    convertIndexEntries($);
+
+    /* Step 2 */
+    const termMap = buildIndexMap($);
+
+    /* Step 3 */
+    linkCrossReferences($, termMap);
+
+    return $.xml();
+}
+
+/* -------------------------
+   Example
+-------------------------- */
 
 const html = `<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml">
 <head>
-    <title>Index</title>
+<title>Index</title>
 </head>
+
 <body>
-    <p class="index-entry"><b>M&amp;M chocolate</b>: 12, 14, 15</p>
-    <p class="index-entry"><i>See also</i> M&amp;M chocolate-flavor</p>
-    <div><hr></hr></div>
-    <!-- <test>&123; -->
+
+<ul>
+<li>M&amp;M chocolate: 12,14,15</li>
+<li><i>Governance Indicators 2006</i>, 45</li>
+<li>M&amp;M chocolate-flavor</li>
+<li><i>See also</i> M&amp;M chocolate-flavor</li>
+<li><i>See</i> sub-Saharan Africa</li>
+<li><i>See</i> sub-Saharan Africa, history</li>
+</ul>
+
 </body>
 </html>`;
 
-console.log('Result:');
 console.log(processHtmlContent(html));
+
+console.log("New Version")
