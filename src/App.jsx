@@ -1,255 +1,200 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import * as cheerio from 'cheerio';
 import JSZip from 'jszip';
 import { saveAs } from 'file-saver';
-import { UploadCloud, CheckCircle, AlertCircle, Loader2 } from 'lucide-react';
+import { UploadCloud, CheckCircle, AlertCircle, Loader2, Sparkles, FileStack } from 'lucide-react';
 import './App.css';
 
-function escapeRegex(string) {
-  return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+/* -------------------------
+   Core Engine Logic 
+-------------------------- */
+
+function normalizeTerm(term) {
+    return term
+        .toLowerCase()
+        .replace(/\(.*/, "")
+        .replace(/[–—]/g, "-")
+        .replace(/-/g, " ")
+        .replace(/[^\w\s]/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
 }
 
-function findTargetId($, term, idInjections) {
-  const termLower = term.toLowerCase().trim();
-  if (!termLower) return null;
+function extractTermParts($li) {
+    const children = $li.contents().toArray();
+    const termNodes = [];
+    const restNodes = [];
+    let separatorFound = false;
 
-  const blockTags = ['p', 'div', 'li', 'td', 'dt', 'dd'];
-  let targetBlock = null;
-
-  const elements = $(blockTags.join(',')).toArray();
-  for (const el of elements) {
-    let text = "";
-    // We get text directly to avoid picking up text deep in another block if it happens
-    $(el).contents().each(function () {
-      if (this.type === 'text') text += this.data;
-      else if (this.type === 'tag') text += $(this).text();
-    });
-    text = text.trim();
-    const textLower = text.toLowerCase();
-
-    if (textLower.startsWith(termLower)) {
-      const regexEnd = new RegExp("^" + escapeRegex(termLower) + "(?![a-z0-9])", "i");
-      if (regexEnd.test(text)) {
-        targetBlock = el;
-        break;
-      }
-    }
-  }
-
-  if (!targetBlock) {
-    const allElements = $('body *').toArray();
-    for (const el of allElements) {
-      const text = $(el).text().trim();
-      if (text.toLowerCase().startsWith(termLower)) {
-        const regexEnd = new RegExp("^" + escapeRegex(termLower) + "(?![a-z0-9])", "i");
-        if (regexEnd.test(text)) {
-          targetBlock = el;
-          break;
+    children.forEach(node => {
+        if (separatorFound) {
+            restNodes.push(node);
+            return;
         }
-      }
-    }
-  }
 
-  if (!targetBlock) return null;
+        if (node.type === "text") {
+            const text = node.data;
+            const match = text.match(/([,:;(])/);
 
-  let $el = $(targetBlock);
-  let existingId = $el.attr('id') || $el.find('[id]').first().attr('id') || $el.find('[name]').first().attr('name');
+            if (match) {
+                const idx = text.indexOf(match[1]);
+                const termText = text.slice(0, idx);
+                const restText = text.slice(idx);
 
-  if (existingId) return existingId;
+                if (termText.trim()) {
+                    termNodes.push({ type: "text", data: termText });
+                }
 
-  const newId = "idx-" + termLower.replace(/[^a-z0-9]/g, '');
-  let finalId = newId;
-  let counter = 1;
+                restNodes.push({ type: "text", data: restText });
+                separatorFound = true;
+            } else {
+                // Split at period if it's near the end of the text node (right before <i>See</i> usually)
+                const matchPeriod = text.match(/(\.)\s*$/);
+                if (matchPeriod) {
+                    const idx = text.lastIndexOf(matchPeriod[1]);
+                    const termText = text.slice(0, idx);
+                    const restText = text.slice(idx);
 
-  // We check existing IDs on the DOM, AND previously planned injections
-  while ($('[id="' + finalId + '"]').length > 0 || idInjections.some(inj => inj.id === finalId)) {
-    finalId = newId + '-' + counter;
-    counter++;
-  }
+                    if (termText.trim()) {
+                        termNodes.push({ type: "text", data: termText });
+                    }
 
-  idInjections.push({
-    startIndex: targetBlock.startIndex,
-    id: finalId
-  });
+                    restNodes.push({ type: "text", data: restText });
+                    separatorFound = true;
+                } else {
+                    termNodes.push(node);
+                }
+            }
+        } else if (node.type === "tag" && (node.name === "i" || node.name === "em")) {
+            const tagText = cheerio.load(node).text().trim().toLowerCase();
+            if (tagText.startsWith("see")) {
+                separatorFound = true;
+                restNodes.push(node);
+            } else {
+                termNodes.push(node);
+            }
+        } else if (node.type === "tag" && (node.name === "ol" || node.name === "ul" || node.name === "dl")) {
+            separatorFound = true;
+            restNodes.push(node);
+        } else {
+            termNodes.push(node);
+        }
+    });
 
-  return finalId;
+    return { termNodes, restNodes };
+}
+
+function convertIndexEntries($) {
+    let counter = 1;
+
+    $("li").each(function () {
+        const $li = $(this);
+
+        if ($li.attr("epub:type") === "index-entry") return;
+
+        const text = $li.text().trim().toLowerCase();
+
+        if (
+            text.startsWith("see ") ||
+            text.startsWith("see also") ||
+            text.startsWith("see under")
+        ) return;
+
+        if (!$li.attr("id")) {
+            $li.attr("id", "idx" + counter);
+            counter++;
+        }
+
+        $li.attr("epub:type", "index-entry");
+
+        const { termNodes, restNodes } = extractTermParts($li);
+
+        if (!termNodes.length) return;
+
+        const span = $('<span epub:type="index-term"></span>');
+        termNodes.forEach(node => span.append(node));
+
+        $li.empty();
+        $li.append(span);
+        restNodes.forEach(node => $li.append(node));
+    });
+}
+
+function buildIndexMap($) {
+    const map = {};
+
+    $('[epub\\:type="index-entry"]').each(function () {
+        const $li = $(this);
+        const term = $li
+            .find('[epub\\:type="index-term"]')
+            .text()
+            .trim();
+
+        const id = $li.attr("id");
+
+        if (!term || !id) return;
+
+        const normalized = normalizeTerm(term);
+        map[normalized] = id;
+    });
+
+    return map;
+}
+
+function linkCrossReferences($, termMap, addLog) {
+    $("li").each(function () {
+        const $li = $(this);
+        const html = $li.html();
+
+        if (!html) return;
+
+        const regex = /(<i[^>]*>\s*)(See(?:\s+also|\s+under)?)(\s*<\/i>)(\s+)([^<]+)/i;
+        const match = html.match(regex);
+
+        if (!match) return;
+
+        let phrase = match[5].trim();
+
+        const mainTerm = phrase
+            .replace(/\(.*/, "")
+            .replace(/,.*/, "")
+            .trim();
+
+        // DECODE html entities before normalizing! This matches mapping precisely!
+        const decodedMainTerm = cheerio.load(mainTerm).text();
+        const normalized = normalizeTerm(decodedMainTerm);
+        const id = termMap[normalized];
+
+        if (!id) {
+            addLog(`Warning: Valid target for "${decodedMainTerm}" not found.`);
+            return;
+        }
+
+        addLog(`Linked: "${decodedMainTerm}" -> #${id}`);
+        const link = `<a href="#${id}">${mainTerm}</a>`;
+        const rest = phrase.substring(mainTerm.length);
+        const newHtml = `${match[1]}${match[2]}${match[3]} ${link}${rest}`;
+
+        $li.html(html.replace(regex, newHtml));
+    });
 }
 
 function processHtmlContent(htmlString, addLog) {
-  // 1. Process <li> elements
-  let resultHtml = "";
-  let lastIndex = 0;
-  const liOpenRegex = /<li((?:\s[^>]*?)?)>/gi;
-  let liMatch;
-  let liCounter = 1;
+    const $ = cheerio.load(htmlString, {
+        xmlMode: true,
+        decodeEntities: true
+    });
 
-  while ((liMatch = liOpenRegex.exec(htmlString)) !== null) {
-    resultHtml += htmlString.substring(lastIndex, liMatch.index);
+    convertIndexEntries($);
+    const termMap = buildIndexMap($);
+    linkCrossReferences($, termMap, addLog);
 
-    let attrs = liMatch[1] || "";
-
-    if (!/epub:type=/i.test(attrs)) {
-      attrs += ` epub:type="index-entry"`;
-    }
-
-    if (!/id=['"]([^'"]+)['"]/.test(attrs)) {
-      let newId = `idx${liCounter}`;
-      while (htmlString.includes(`id="${newId}"`) || htmlString.includes(`id='${newId}'`)) {
-        liCounter++;
-        newId = `idx${liCounter}`;
-      }
-      attrs += ` id="${newId}"`;
-      liCounter++;
-    }
-
-    resultHtml += `<li${attrs}>`;
-
-    let currentIndex = liOpenRegex.lastIndex;
-    let inTag = false;
-    let splitAt = -1;
-    let limit = Math.min(currentIndex + 1500, htmlString.length);
-
-    let initialStr = htmlString.substring(currentIndex, currentIndex + 50);
-    if (initialStr.match(/^\s*(?:<[^>]+>\s*)*[Ss]ee\b(?:\s+also|\s+under)?/i)) {
-      splitAt = currentIndex;
-    } else {
-      for (let i = currentIndex; i < limit; i++) {
-        let c = htmlString[i];
-
-        if (!inTag && c === '<') {
-          let upcoming = htmlString.substring(i, i + 10).toLowerCase();
-          if (upcoming.startsWith('</li') || upcoming.startsWith('<ol') ||
-            upcoming.startsWith('<ul') || upcoming.startsWith('<dl') ||
-            upcoming.startsWith('<div') || upcoming.startsWith('<p') ||
-            upcoming.startsWith('<br')) {
-            splitAt = i;
-            break;
-          }
-          inTag = true;
-        } else if (inTag && c === '>') {
-          inTag = false;
-          continue;
-        }
-
-        if (!inTag && c !== '>') {
-          if (c === ',' || c === '\n' || c === '\r') {
-            splitAt = i;
-            break;
-          }
-
-          let rem = htmlString.substring(i, i + 30);
-          if (rem.match(/^\s+(?:<[^>]+>\s*)*[Ss]ee\b(?:\s+also|\s+under)?/i)) {
-            splitAt = i;
-            break;
-          }
-        }
-      }
-    }
-
-    let advanceToIndex = -1;
-
-    if (splitAt !== -1 && splitAt > currentIndex) {
-      let termRaw = htmlString.substring(currentIndex, splitAt);
-      let leadSpaceMatch = termRaw.match(/^\s*/);
-      let trailSpaceMatch = termRaw.match(/\s*$/);
-      let leadSpace = leadSpaceMatch ? leadSpaceMatch[0] : "";
-      let trailSpace = trailSpaceMatch ? trailSpaceMatch[0] : "";
-      let termTrim = termRaw.trim();
-
-      if (termTrim) {
-        resultHtml += `${leadSpace}<span epub:type="index-term">${termTrim}</span>${trailSpace}`;
-      } else {
-        resultHtml += termRaw;
-      }
-      advanceToIndex = splitAt;
-    } else if (splitAt === currentIndex) {
-      advanceToIndex = currentIndex;
-    } else if (splitAt === -1) {
-      let termRaw = htmlString.substring(currentIndex, limit);
-      let leadSpaceMatch = termRaw.match(/^\s*/);
-      let trailSpaceMatch = termRaw.match(/\s*$/);
-      let leadSpace = leadSpaceMatch ? leadSpaceMatch[0] : "";
-      let trailSpace = trailSpaceMatch ? trailSpaceMatch[0] : "";
-      let termTrim = termRaw.trim();
-
-      if (termTrim) {
-        resultHtml += `${leadSpace}<span epub:type="index-term">${termTrim}</span>${trailSpace}`;
-      } else {
-        resultHtml += termRaw;
-      }
-      advanceToIndex = limit;
-    }
-
-    lastIndex = advanceToIndex;
-    liOpenRegex.lastIndex = advanceToIndex;
-  }
-  resultHtml += htmlString.substring(lastIndex);
-  htmlString = resultHtml;
-
-  const regexHtml = /(<i[^>]*>\s*)?([Ss]ee(?:\s+also|\s+under)?)(?!\s*also)(\s*<\/i>)?(\s+)((?:[^<>\-;,&]|&(?:[a-zA-Z0-9]+|#[0-9]+|#x[a-fA-F0-9]+);)+)/g;
-
-  const termsToLink = new Set();
-  let m;
-
-  // Dry run to collect terms purely from string
-  while ((m = regexHtml.exec(htmlString)) !== null) {
-    let termUntrimmed = m[5];
-    let term = termUntrimmed.trimEnd();
-    if (term.toLowerCase() !== "see" && term.toLowerCase() !== "see also" && term.toLowerCase() !== "see under") {
-      termsToLink.add(term);
-    }
-  }
-
-  // We use Cheerio ONLY for READ-ONLY lookups of start indices
-  const $ = cheerio.load(htmlString, { withStartIndices: true, xmlMode: true, decodeEntities: true });
-
-  const idInjections = [];
-  const termToId = {};
-  for (const term of termsToLink) {
-    const id = findTargetId($, term, idInjections);
-    if (id) {
-      termToId[term] = id;
-      addLog(`Linked: "${term}" -> #${id}`);
-    } else {
-      addLog(`Warning: Target entry not found for "${term}"`);
-    }
-  }
-
-  let modifiedHtml = htmlString;
-
-  // Sort descending so backward replacements don't shift forward indices
-  idInjections.sort((a, b) => b.startIndex - a.startIndex);
-
-  for (const inj of idInjections) {
-    if (inj.startIndex == null) continue;
-
-    const prefix = modifiedHtml.substring(0, inj.startIndex);
-    const remaining = modifiedHtml.substring(inj.startIndex);
-
-    // Look for the opening tag match e.g. `<p` or `<div`
-    const tagMatch = remaining.match(/^<([a-zA-Z0-9\-:]+)/);
-    if (tagMatch) {
-      const insertPos = tagMatch[0].length;
-      modifiedHtml = prefix + remaining.substring(0, insertPos) + ` id="${inj.id}"` + remaining.substring(insertPos);
-    }
-  }
-
-  // Final replacement of the Links directly on the string
-  modifiedHtml = modifiedHtml.replace(regexHtml, (match, iTagStart, seeText, iTagEnd, spaces, termUntrimmed) => {
-    let term = termUntrimmed.trimEnd();
-    let trailingSpace = termUntrimmed.substring(term.length);
-
-    let id = termToId[term];
-    if (id) {
-      return `${iTagStart || ''}${seeText}${iTagEnd || ''}${spaces}<a href="#${id}">${term}</a>${trailingSpace}`;
-    } else {
-      return match;
-    }
-  });
-
-  return modifiedHtml;
+    return $.xml();
 }
 
+/* -------------------------
+   Application Component
+-------------------------- */
 
 function App() {
   const [isDragging, setIsDragging] = useState(false);
@@ -290,7 +235,6 @@ function App() {
         let indexFileName = '';
         const possibleFiles = [];
 
-        // Find index file
         for (const [filename, fileObj] of Object.entries(contents.files)) {
           if (!fileObj.dir) {
             const nameLower = filename.toLowerCase();
@@ -318,7 +262,6 @@ function App() {
 
         await continueProcessingZip(zip, file, indexFileName);
 
-
       } else if (ext === 'xhtml' || ext === 'html') {
         addLog(`Loading file: ${file.name}`);
         const text = await file.text();
@@ -326,7 +269,7 @@ function App() {
 
         const blob = new Blob([updatedHtml], { type: 'application/xhtml+xml' });
         saveAs(blob, `Linked_${file.name}`);
-        addLog('Download readyyyyyy!');
+        addLog('Processing complete! File generated.');
         setStatus('success');
       } else {
         throw new Error('Unsupported format. Please upload an .epub or .xhtml file.');
@@ -352,7 +295,7 @@ function App() {
 
       const blob = await zip.generateAsync({ type: 'blob' });
       saveAs(blob, `Linked_${originalFile.name}`);
-      addLog('Download ready!');
+      addLog('Processing complete. Clean, rich EPUB downloaded!');
       setStatus('success');
     } catch (err) {
       console.error(err);
@@ -378,84 +321,118 @@ function App() {
 
   return (
     <div className="app-container">
-      <div className="header">
-        <h1>IndexLinker (v1.0.12)</h1>
-        <p>Intelligently hyper-link your EPUB index references.</p>
-      </div>
+      <div className="header-blob blob-1"></div>
+      <div className="header-blob blob-2"></div>
+      <div className="glass-panel">
+        <div className="header">
+            <div className="logo-container">
+                <Sparkles className="logo-icon" />
+            </div>
+            <h1>Index Linker</h1>
+            <p>Smart hyper-linking for your EPUB index references.</p>
+        </div>
 
-      <div
-        className={`upload-card ${isDragging ? 'dragging' : ''}`}
-        onDragOver={handleDragOver}
-        onDragLeave={handleDragLeave}
-        onDrop={handleDrop}
-      >
-        <UploadCloud className="upload-icon" />
-        <div className="upload-title">Select or drag & drop a file</div>
-        <div className="upload-desc">Supports .epub & .xhtml files. Automatic processing.</div>
-
-        <input
-          type="file"
-          ref={fileInputRef}
-          className="file-input"
-          accept=".epub,.xhtml,.html"
-          onChange={handleFileChange}
-        />
-        <button className="btn-primary" onClick={() => fileInputRef.current.click()}>
-          Browse Files
-        </button>
+        <div
+            className={`upload-zone ${isDragging ? 'dragging' : ''}`}
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+        >
+            <div className="upload-border"></div>
+            <div className="upload-content">
+                <div className="icon-wrapper">
+                    <CloudIcon isDragging={isDragging} />
+                </div>
+                <h3>Drag & Drop your file</h3>
+                <p>Supports .epub & .xhtml formats</p>
+                <input
+                    type="file"
+                    ref={fileInputRef}
+                    className="file-hidden"
+                    accept=".epub,.xhtml,.html"
+                    onChange={handleFileChange}
+                />
+                <button className="btn-glow" onClick={() => fileInputRef.current.click()}>
+                    Browse Files
+                </button>
+            </div>
+        </div>
 
         {showFileSelector && (
-          <div className="status-section" style={{ marginTop: '20px', padding: '15px' }}>
-            <div style={{ marginBottom: '10px', color: '#fff' }}>Select Index File:</div>
+          <div className="file-selector-panel animate-fade-in">
+            <div className="panel-title">
+                <FileStack size={18} />
+                <span>Select Target Index</span>
+            </div>
             <select
               id="indexFileSelect"
-              style={{ width: '100%', padding: '8px', marginBottom: '15px', borderRadius: '4px', border: '1px solid #4B5563', background: '#374151', color: '#fff' }}
+              className="modern-select"
             >
               {availableFiles.map(f => (
                 <option key={f} value={f}>{f}</option>
               ))}
             </select>
             <button
-              className="btn-primary"
-              style={{ width: '100%' }}
+              className="btn-glow full-width"
               onClick={() => {
                 const sel = document.getElementById('indexFileSelect').value;
                 continueProcessingZip(zipInstance, currentFileObj, sel);
               }}
             >
-              Process Selected
+              Start Process
             </button>
           </div>
         )}
 
         {status !== 'idle' && (
-          <div className="status-section">
-            <div className="status-flex">
-              {status === 'processing' && <Loader2 className="status-icon spin" style={{ color: '#fff' }} />}
-              {status === 'success' && <CheckCircle className="status-icon success-text" />}
-              {status === 'error' && <AlertCircle className="status-icon error-text" />}
-
-              <div className="status-text">
-                {status === 'processing' && 'Processing your file...'}
-                {status === 'success' && 'Done! Modifed file downloaded.'}
-                {status === 'error' && <span className="error-text">Failed to process</span>}
+          <div className={`status-panel ${status === 'error' ? 'error' : ''} animate-slide-up`}>
+              <div className="status-header">
+                {status === 'processing' && <Loader2 className="status-badge pulse spin" />}
+                {status === 'success' && <CheckCircle className="status-badge success" />}
+                {status === 'error' && <AlertCircle className="status-badge error" />}
+                <div className="status-message">
+                  {status === 'processing' && 'Analyzing index patterns...'}
+                  {status === 'success' && 'Done! Modified file is ready.'}
+                  {status === 'error' && 'Failed to process file'}
+                </div>
               </div>
-            </div>
-
-            {status === 'error' && <div className="status-sub error-text">{errorMsg}</div>}
-
-            {logs.length > 0 && (
-              <div className="log-box">
-                {logs.map((log, i) => (
-                  <div key={i}>{'>'} {log}</div>
-                ))}
-              </div>
-            )}
+              
+              {status === 'error' && <div className="error-details">{errorMsg}</div>}
+              
+              {logs.length > 0 && (
+                <div className="terminal-container">
+                    <div className="terminal-header">
+                        <span className="dot dot-red"></span>
+                        <span className="dot dot-yellow"></span>
+                        <span className="dot dot-green"></span>
+                    </div>
+                    <div className="terminal-body" id="log-view">
+                        {logs.map((log, i) => (
+                            <div key={i} className="log-line">
+                                <span className="log-arrow">{'>'}</span> {log}
+                            </div>
+                        ))}
+                    </div>
+                </div>
+              )}
           </div>
         )}
       </div>
     </div>
   );
+}
+
+function CloudIcon({ isDragging }) {
+    return (
+        <svg 
+            width="64" height="64" viewBox="0 0 24 24" fill="none" 
+            stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" 
+            className={`upload-svg ${isDragging ? 'bounce' : 'float'}`}
+        >
+            <path d="M17.5 19C19.9853 19 22 16.9853 22 14.5C22 12.0147 19.9853 10 17.5 10C17.2001 10 16.9071 10.0294 16.626 10.0857C15.8239 6.58156 12.6394 4 8.75 4C4.47029 4 1 7.47029 1 11.75C1 14.7679 2.72314 17.3828 5.2443 18.6659" />
+            <path d="M12 11V21M12 11L8 15M12 11L16 15" />
+        </svg>
+    );
 }
 
 export default App;
